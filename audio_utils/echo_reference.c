@@ -58,6 +58,9 @@ struct echo_reference {
     pthread_cond_t cond;                       // condition signaled when data is ready to read
     struct resampler_itfe *down_sampler;       // input resampler
     struct resampler_buffer_provider provider; // resampler buffer provider
+#ifdef OMAP_ENHANCEMENT
+    uint32_t cnt;                   // frame counter for robust control of signal alignment code
+#endif
 };
 
 
@@ -113,6 +116,9 @@ static void echo_reference_reset_l(struct echo_reference *er)
     er->wr_buf_size = 0;
     er->wr_render_time.tv_sec = 0;
     er->wr_render_time.tv_nsec = 0;
+#ifdef OMAP_ENHANCEMENT
+    er->cnt = 0;
+#endif
 }
 
 static int echo_reference_write(struct echo_reference_itfe *echo_reference,
@@ -256,8 +262,16 @@ exit:
     return status;
 }
 
+#ifndef OMAP_ENHANCEMENT
 #define MIN_DELAY_UPDATE_NS 62500 // delay jump threshold to update ref buffer
                                   // 0.5 samples at 8kHz in nsecs
+#else
+// used for signal alignment
+// if too sensitive, introduces some discontinuities
+// align signals to within 10ms, the 10ms delay will be modeled in AEC.
+#define MIN_DELAY_UPDATE_NS 10000000 // delay jump threshold to update ref buffer
+                                     // 0.5 samples at 8kHz in nsecs
+#endif
 
 
 static int echo_reference_read(struct echo_reference_itfe *echo_reference,
@@ -339,7 +353,13 @@ static int echo_reference_read(struct echo_reference_itfe *echo_reference,
 
             delayNs -= expectedDelayNs;
 
+#ifndef OMAP_ENHANCEMENT
             if (abs(delayNs) >= MIN_DELAY_UPDATE_NS) {
+#else
+            // er->cnt is used to guarantee the robustness of delay estimation
+            // after 100 valid frames, the delay estimates will be ignored
+            if (abs(delayNs) >= MIN_DELAY_UPDATE_NS && er->cnt <= 100) {
+#endif
                 if (delayNs < 0) {
                     size_t previousFrameIn = er->frames_in;
                     er->frames_in = (expectedDelayNs * er->rd_sampling_rate)/1000000000;
@@ -354,9 +374,25 @@ static int echo_reference_read(struct echo_reference_itfe *echo_reference,
                         LOGV("EchoReference::read: increasing buffer size to %d", er->buf_size);
                     }
 
-                    if (offset > 0)
+#ifndef OMAP_ENHANCEMENT
+                    if (offset > 0) {
                         memset((char *)er->buffer + previousFrameIn * er->rd_frame_size,
                                0, offset * er->rd_frame_size);
+#else
+                    if (offset > 0) {
+                        // insert offset frames of zero samples before the
+                        // existing samples
+                        char *cp1, *cp2;
+                        size_t idxt;
+                        cp1 = cp2 = (char *)er->buffer;
+                        cp1 = cp1+er->frames_in*er->rd_frame_size-1;
+                        cp2 = cp2+previousFrameIn*er->rd_frame_size-1;
+                        for(idxt = 0; idxt < previousFrameIn*er->rd_frame_size; idxt++) {
+                            *cp1-- = *cp2--;
+                        }
+                        memset((char *)er->buffer, 0, offset * er->rd_frame_size);
+                    }
+#endif
                 } else {
                     size_t  previousFrameIn = er->frames_in;
                     int     framesInInt = (int)(((int64_t)expectedDelayNs *
@@ -376,7 +412,9 @@ static int echo_reference_read(struct echo_reference_itfe *echo_reference,
                         } else {
                             LOGV("framesInInt = %d", framesInInt);
                         }
+#ifndef OMAP_ENHANCEMENT
                         framesInInt = buffer->frame_count;
+#endif
                     } else {
                         if (offset > 0) {
                             memcpy(er->buffer, (char *)er->buffer + (offset * er->rd_frame_size),
@@ -395,6 +433,17 @@ static int echo_reference_read(struct echo_reference_itfe *echo_reference,
                  expectedDelayNs, er->playback_delay, buffer->delay_ns, timeDiff);
         }
     }
+
+#ifdef OMAP_ENHANCEMENT
+    // for safety
+    if (er->frames_in < buffer->frame_count) {
+        buffer->frame_count = er->frames_in;
+    }
+    // valid frame, increase the frame counter
+    if (er->cnt < 100 && buffer->frame_count > 0) {
+        er->cnt++;
+    }
+#endif
 
     memcpy(buffer->raw,
            (char *)er->buffer,
