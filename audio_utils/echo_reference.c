@@ -375,7 +375,7 @@ static int echo_reference_read(struct echo_reference_itfe *echo_reference,
                     }
 
 #ifndef OMAP_ENHANCEMENT
-                    if (offset > 0) {
+                    if (offset > 0)
                         memset((char *)er->buffer + previousFrameIn * er->rd_frame_size,
                                0, offset * er->rd_frame_size);
 #else
